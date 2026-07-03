@@ -42,7 +42,22 @@
 
 > 不配置时默认为 `plan500`，即积分达到 500 时自动兑换 100 天
 
-4. 手机推送（非必须）
+4. 飞书推送（非必须，推荐）
+
+- 在飞书群里添加「自定义机器人」，复制机器人 Webhook 地址。
+- 添加1个`repository secret`，命名为`FEISHU_WEBHOOK`，其值为飞书自定义机器人的 webhook 地址。
+- 如果机器人开启了「签名校验」，再添加1个`repository secret`，命名为`FEISHU_SECRET`，其值为飞书机器人签名密钥。
+
+> 配置 `FEISHU_WEBHOOK` 后，脚本会优先使用飞书推送；未配置时才会尝试 PushDeer。
+
+5. Cookie 过期提醒（非必须）
+
+- 脚本会自动解析 `koa:sess` 中的 `_expire` 字段，并在通知中显示 Cookie 到期时间。
+- 默认提前 7 天提醒。可以添加1个`repository secret`，命名为`COOKIE_EXPIRE_WARN_DAYS`，例如填 `14` 表示提前 14 天提醒。
+
+> Cookie 过期后脚本无法自动重新登录。请重新登录 GLaDOS/Railgun，复制新的 Cookie 后更新 `GLADOS_COOKIES`。
+
+6. PushDeer 手机推送（非必须）
 
 - 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
 

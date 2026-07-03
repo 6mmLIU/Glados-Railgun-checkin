@@ -1,10 +1,15 @@
 import requests
+import base64
+import hashlib
+import hmac
 import json
 import os
 import logging
+import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
 from pypushdeer import PushDeer
 from logging_config import init_logger
 
@@ -95,15 +100,21 @@ class Config:
     """应用配置"""
 
     ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
+    ENV_FEISHU_WEBHOOK = "FEISHU_WEBHOOK"
+    ENV_FEISHU_SECRET = "FEISHU_SECRET"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_COOKIE_EXPIRE_WARN_DAYS = "COOKIE_EXPIRE_WARN_DAYS"
 
     """默认兑换计划"""
     DEFAULT_EXCHANGE_PLAN = "plan500"
 
     """默认是否输出详细响应"""
     DEFAULT_VERBOSE = False
+
+    """默认提前多少天提醒 Cookie 过期"""
+    DEFAULT_COOKIE_EXPIRE_WARN_DAYS = 7
 
     """默认域名"""
     DOMAINS = ["glados.cloud", "railgun.info"]
@@ -117,23 +128,32 @@ class Config:
 
     def __init__(self):
         self.push_key: str = ""
+        self.feishu_webhook: str = ""
+        self.feishu_secret: str = ""
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        self.cookie_expire_warn_days: int = self.DEFAULT_COOKIE_EXPIRE_WARN_DAYS
         self._load_config()
 
     def _load_config(self) -> None:
         """加载配置"""
         push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
+        feishu_webhook_env: Optional[str] = os.environ.get(self.ENV_FEISHU_WEBHOOK)
+        feishu_secret_env: Optional[str] = os.environ.get(self.ENV_FEISHU_SECRET)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
+        cookie_expire_warn_days_env: Optional[str] = os.environ.get(self.ENV_COOKIE_EXPIRE_WARN_DAYS)
 
-        if not push_key_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
-            self.push_key = ""
-        else:
+        if push_key_env:
             self.push_key = push_key_env
+
+        if feishu_webhook_env:
+            self.feishu_webhook = feishu_webhook_env
+
+        if feishu_secret_env:
+            self.feishu_secret = feishu_secret_env
 
         if not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
@@ -155,10 +175,15 @@ class Config:
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
-        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
+        if self.feishu_webhook:
+            logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_FEISHU_WEBHOOK} 已设置，将优先使用飞书推送。")
+        elif self.push_key:
+            logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} 已设置，将使用 PushDeer 推送。")
+        else:
+            logger.info(f"{LogEmoji.INFO} 未设置推送渠道，仅输出 Actions 日志。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
-        if verbose_env is not None:
+        if verbose_env:
             verbose_env_lower = verbose_env.lower()
             if verbose_env_lower in ["true", "1", "yes", "y"]:
                 self.verbose = True
@@ -168,6 +193,112 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
+
+        if cookie_expire_warn_days_env:
+            try:
+                warn_days = int(cookie_expire_warn_days_env)
+                if warn_days < 0:
+                    raise ValueError
+                self.cookie_expire_warn_days = warn_days
+            except ValueError:
+                logger.warning(
+                    f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIE_EXPIRE_WARN_DAYS}' 的值 "
+                    f"'{cookie_expire_warn_days_env}' 无效，将使用默认值 {self.DEFAULT_COOKIE_EXPIRE_WARN_DAYS}。"
+                )
+
+        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_COOKIE_EXPIRE_WARN_DAYS}: {self.cookie_expire_warn_days}。")
+
+
+@dataclass()
+class CookieExpirationInfo:
+    """Cookie 过期信息"""
+
+    cookie_index: int
+    user_id: Optional[Union[int, str]]
+    expire_ms: Optional[int]
+    expire_at: Optional[datetime]
+    days_left: Optional[int]
+    should_warn: bool
+    message: str
+
+
+class CookieInspector:
+    """解析 koa-session Cookie 过期时间"""
+
+    SESSION_COOKIE_NAME = "koa:sess="
+
+    @classmethod
+    def inspect(cls, cookie: str, cookie_index: int, warn_days: int) -> CookieExpirationInfo:
+        payload = cls._extract_session_payload(cookie)
+        if not payload:
+            return CookieExpirationInfo(
+                cookie_index=cookie_index,
+                user_id=None,
+                expire_ms=None,
+                expire_at=None,
+                days_left=None,
+                should_warn=True,
+                message=f"Cookie {cookie_index} 未解析到 koa:sess，无法判断登录态过期时间，请确认 Cookie 是否完整。",
+            )
+
+        user_id = payload.get("userId")
+        expire_ms = payload.get("_expire")
+        if not isinstance(expire_ms, (int, float)):
+            return CookieExpirationInfo(
+                cookie_index=cookie_index,
+                user_id=user_id,
+                expire_ms=None,
+                expire_at=None,
+                days_left=None,
+                should_warn=True,
+                message=f"Cookie {cookie_index} 未解析到 _expire，无法判断登录态过期时间，请确认 Cookie 是否完整。",
+            )
+
+        expire_at = datetime.fromtimestamp(expire_ms / 1000, tz=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+        now = datetime.now(timezone(timedelta(hours=8)))
+        seconds_left = (expire_at - now).total_seconds()
+        days_left = int(seconds_left // 86400)
+        should_warn = seconds_left <= warn_days * 86400
+
+        if seconds_left <= 0:
+            message = f"Cookie {cookie_index} 已过期，请重新登录获取新的 Cookie。"
+        elif should_warn:
+            message = f"Cookie {cookie_index} 将在 {days_left} 天内过期，到期时间 {expire_at:%Y-%m-%d %H:%M:%S}。"
+        else:
+            message = f"Cookie {cookie_index} 到期时间 {expire_at:%Y-%m-%d %H:%M:%S}，剩余约 {days_left} 天。"
+
+        if user_id is not None:
+            message = f"{message} 用户 ID: {user_id}。"
+
+        return CookieExpirationInfo(
+            cookie_index=cookie_index,
+            user_id=user_id,
+            expire_ms=int(expire_ms),
+            expire_at=expire_at,
+            days_left=days_left,
+            should_warn=should_warn,
+            message=message,
+        )
+
+    @classmethod
+    def _extract_session_payload(cls, cookie: str) -> Optional[Dict]:
+        session_value = None
+        for part in cookie.split(";"):
+            item = part.strip()
+            if item.startswith(cls.SESSION_COOKIE_NAME):
+                session_value = item[len(cls.SESSION_COOKIE_NAME):]
+                break
+
+        if not session_value:
+            return None
+
+        try:
+            padded = session_value + "=" * (-len(session_value) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("utf-8"))
+            payload = json.loads(decoded.decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
 
 
 class API:
@@ -398,6 +529,9 @@ class PushService:
 
     def send(self, title: str, content: str) -> bool:
         """发送推送"""
+        if self.config.feishu_webhook:
+            return self._send_feishu(title, content)
+
         if not self.config.push_key:
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
             return False
@@ -411,6 +545,40 @@ class PushService:
             logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
             return False
 
+    def _send_feishu(self, title: str, content: str) -> bool:
+        """发送飞书自定义机器人推送"""
+        message = f"{title}\n\n{content}".strip()
+        payload = {
+            "msg_type": "text",
+            "content": {
+                "text": message,
+            },
+        }
+
+        if self.config.feishu_secret:
+            timestamp = str(int(time.time()))
+            payload["timestamp"] = timestamp
+            payload["sign"] = self._build_feishu_sign(timestamp, self.config.feishu_secret)
+
+        try:
+            response = requests.post(self.config.feishu_webhook, json=payload, timeout=(10, 30))
+            data = response.json()
+            if response.ok and data.get("code", data.get("StatusCode")) in (0, None):
+                logger.info(f"{LogEmoji.SUCCESS} 飞书推送通知发送成功。")
+                return True
+
+            logger.error(f"{LogEmoji.ERROR} 飞书推送通知失败: HTTP {response.status_code}, 响应: {response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"{LogEmoji.ERROR} 发送飞书推送通知失败: {e}")
+            return False
+
+    @staticmethod
+    def _build_feishu_sign(timestamp: str, secret: str) -> str:
+        string_to_sign = f"{timestamp}\n{secret}"
+        digest = hmac.new(string_to_sign.encode("utf-8"), b"", digestmod=hashlib.sha256).digest()
+        return base64.b64encode(digest).decode("utf-8")
+
 
 class Checker:
     """签到"""
@@ -418,6 +586,7 @@ class Checker:
     def __init__(self, config: Config):
         self.config = config
         self.results = []
+        self.cookie_expiration_infos: List[CookieExpirationInfo] = []
 
     def _log(self, cookie_idx: int, domain: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
@@ -436,6 +605,10 @@ class Checker:
 
         for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
+            cookie_expiration_info = CookieInspector.inspect(cookie, cookie_idx, self.config.cookie_expire_warn_days)
+            self.cookie_expiration_infos.append(cookie_expiration_info)
+            log_level = logging.WARNING if cookie_expiration_info.should_warn else logging.INFO
+            logger.log(log_level, f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.INFO} {cookie_expiration_info.message}")
 
             for domain in self.config.DOMAINS:
                 task_idx += 1
@@ -488,7 +661,7 @@ class Checker:
         """获取所有结果"""
         return [result.to_dict() for result in self.results]
 
-    def format_results(self) -> Tuple[str, str, str]:
+    def format_results(self) -> Tuple[str, str, str, bool]:
         """格式化结果"""
         results = self.get_results()
 
@@ -496,13 +669,26 @@ class Checker:
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
 
+        action_lines = self._build_actionable_notification_lines(results)
+        should_notify = bool(action_lines)
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
+        if should_notify:
+            title = f"GLaDOS 需要关注: {len(action_lines)} 条提醒"
 
-        send_content_lines = []
         log_content_lines = []
+        if self.cookie_expiration_infos:
+            log_content_lines.append("【Cookie 到期检查】")
+            for info in self.cookie_expiration_infos:
+                line = info.message
+                if self.config.verbose or info.should_warn:
+                    log_content_lines.append(line)
+
+            if len(log_content_lines) > 1:
+                log_content_lines.append("")
+
+        log_content_lines.append("【签到结果】")
         for i, res in enumerate(results, 1):
             line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
-            send_content_lines.append(line)
 
             if self.config.verbose:
                 log_line = line
@@ -510,9 +696,45 @@ class Checker:
                 log_line = f"#{i} {res['status']}"
             log_content_lines.append(log_line)
 
-        content = "\n".join(send_content_lines)
+        content = "\n".join(action_lines)
         log_content = "\n".join(log_content_lines)
-        return title, content, log_content
+        return title, content, log_content, should_notify
+
+    def _build_actionable_notification_lines(self, results: List[Dict[str, str]]) -> List[str]:
+        """只生成需要打扰用户的通知内容"""
+        lines = []
+
+        cookie_warning_lines = [info.message for info in self.cookie_expiration_infos if info.should_warn]
+        if cookie_warning_lines:
+            lines.append("【Cookie 到期提醒】")
+            lines.extend(cookie_warning_lines)
+
+        fully_failed_cookie_lines = []
+        for cookie_idx in sorted({res["cookie_index"] for res in results}):
+            cookie_results = [res for res in results if res["cookie_index"] == cookie_idx]
+            if cookie_results and all(res["code"] == CheckinStatus.FAILURE for res in cookie_results):
+                domains = ", ".join(f"{res['domain']}:{res['status']}" for res in cookie_results)
+                fully_failed_cookie_lines.append(f"Cookie {cookie_idx} 所有域名签到失败，请检查 Cookie 是否过期或失效。{domains}")
+
+        if fully_failed_cookie_lines:
+            if lines:
+                lines.append("")
+            lines.append("【签到失败提醒】")
+            lines.extend(fully_failed_cookie_lines)
+
+        exchange_success_lines = []
+        for res in results:
+            exchange_result = str(res.get("exchange", ""))
+            if exchange_result.startswith("兑换成功"):
+                exchange_success_lines.append(f"Cookie {res['cookie_index']} {res['domain']} {exchange_result}，剩余:{res['days']} 总积分:{res['points_total']}")
+
+        if exchange_success_lines:
+            if lines:
+                lines.append("")
+            lines.append("【积分兑换提醒】")
+            lines.extend(exchange_success_lines)
+
+        return lines
 
 
 # 初始化日志
@@ -529,6 +751,7 @@ def main():
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
+            should_notify = True
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -537,17 +760,23 @@ def main():
 
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
-            title, content, log_content = checker.format_results()
+            title, content, log_content, should_notify = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        should_notify = True
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
+    if not should_notify:
+        logger.info(f"{LogEmoji.INFO} 本次没有 Cookie 临期、整体签到失败或兑换成功，跳过推送通知。")
+    elif "config" in locals():
+        push_service = PushService(config)
+        push_service.send(title, content)
+    else:
+        logger.info(f"{LogEmoji.WARNING} 配置未完成加载，跳过推送通知。")
     logger.info(f"{LogEmoji.END} 签到完成")
 
 
