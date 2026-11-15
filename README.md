@@ -1,4 +1,8 @@
-# Glados自动签到
+# Railgun 自动签到
+
+GLaDOS 的积分页面当前要求真人验证。请在 [GLaDOS Points](https://glados.cloud/console/checkin) 完成验证后点击 Checkin。
+
+Railgun 的 GitHub Actions 计划每天北京时间 12:17 和 18:17 运行，签到失败会标记任务失败。
 
 ## 食用方式：
 
@@ -14,9 +18,9 @@
 
 1. 跳转至自己的仓库的`Settings`->`Secrets and variables`->`Action`
 
-2. 添加1个`repository secret`，命名为`GLADOS_COOKIES`，其值对应GLaDOS账号的cookie值中的有效部分（获取方式如下）
+2. 添加1个`repository secret`，命名为`GLADOS_COOKIES`，其值对应 Railgun 账号的 Cookie 值中的有效部分（获取方式如下）
 
-- 在GLaDOS的签到页面按`F12`
+- 在 Railgun 的积分页面按`F12`
 
 - 切换到`Network`页面下，刷新
 
@@ -28,7 +32,7 @@
 
 ![图片加载失败](imgs/3.png)
 
-- 多账号请在 `COOKIES` 中 添加多个 `cookies` 中间使用 `&`连接即可。（例如： `c1&c3&c3...`）
+- `GLADOS_COOKIES` 中的多个 Cookie 用 `&` 分隔。旧列表混合了两个网站的 Cookie 时，可以用仓库变量 `RAILGUN_COOKIE_INDEX` 指定 Railgun Cookie 的序号，序号从 1 开始。只保存一个 Railgun Cookie 时，把序号设为 1 或清除该变量。
 
 3. 配置积分兑换策略（非必须）
 
@@ -42,22 +46,14 @@
 
 > 不配置时默认为 `plan500`，即积分达到 500 时自动兑换 100 天
 
-4. 飞书推送（非必须，推荐）
-
-- 在飞书群里添加「自定义机器人」，复制机器人 Webhook 地址。
-- 添加1个`repository secret`，命名为`FEISHU_WEBHOOK`，其值为飞书自定义机器人的 webhook 地址。
-- 如果机器人开启了「签名校验」，再添加1个`repository secret`，命名为`FEISHU_SECRET`，其值为飞书机器人签名密钥。
-
-> 配置 `FEISHU_WEBHOOK` 后，脚本会优先使用飞书推送；未配置时才会尝试 PushDeer。
-
-5. Cookie 过期提醒（非必须）
+4. Cookie 过期检查
 
 - 脚本会自动解析 `koa:sess` 中的 `_expire` 字段，并在通知中显示 Cookie 到期时间。
 - 默认提前 7 天提醒。可以添加1个`repository secret`，命名为`COOKIE_EXPIRE_WARN_DAYS`，例如填 `14` 表示提前 14 天提醒。
 
-> Cookie 过期后脚本无法自动重新登录。请重新登录 GLaDOS/Railgun，复制新的 Cookie 后更新 `GLADOS_COOKIES`。
+> Cookie 过期后脚本无法自动重新登录。请重新登录 Railgun，复制新的 Cookie 后更新 `GLADOS_COOKIES`。
 
-6. PushDeer 手机推送（非必须）
+5. PushDeer 手机推送（非必须）
 
 - 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
 
