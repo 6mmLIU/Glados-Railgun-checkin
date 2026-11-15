@@ -7,6 +7,8 @@ on:
         description: "今天已签到时也核验云端浏览器流程"
         type: boolean
         default: false
+  schedule:
+    - cron: "17 1 * * *"
 
 permissions:
   contents: read
@@ -20,6 +22,9 @@ jobs:
     name: GLaDOS via Google Chrome
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -31,3 +36,6 @@ jobs:
           GLADOS_BROWSER_SESSION: ${{ secrets.GLADOS_BROWSER_SESSION }}
           VERIFY_BROWSER: ${{ inputs.verify_browser && '1' || '0' }}
         run: xvfb-run -a node .github/scripts/glados-browser.mjs
+      - name: Keep the scheduled workflow active
+        if: ${{ github.event_name == 'schedule' && !cancelled() }}
+        uses: liskin/gh-workflow-keepalive@v1

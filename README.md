@@ -1,6 +1,6 @@
 # Railgun 自动签到
 
-GLaDOS 的积分页面当前要求真人验证。请在 [GLaDOS Points](https://glados.cloud/console/checkin) 完成验证后点击 Checkin。
+GLaDOS 网页签到每天北京时间 09:17 在 GitHub 托管的 Chrome 中运行，使用独立的 `GLADOS_BROWSER_SESSION` 仓库 Secret。工作流会核对官网签到响应和当天积分流水。会话需要重新登录时，请使用与云端 Chrome 匹配的会话更新该 Secret。
 
 Railgun 的 GitHub Actions 计划每天北京时间 12:17 和 18:17 运行，签到失败会标记任务失败。
 
