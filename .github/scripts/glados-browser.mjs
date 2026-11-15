@@ -67,6 +67,72 @@ async function readPoints(page) {
   });
 }
 
+async function useVerificationCheckbox(page) {
+  for (const frame of page.frames()) {
+    if (!frame.url().startsWith("https://challenges.cloudflare.com/")) continue;
+    let devtools;
+    try {
+      let target = {};
+      try {
+        devtools = await page.context().newCDPSession(frame);
+      } catch {
+        devtools = await page.context().newCDPSession(page);
+        const { frameTree } = await devtools.send("Page.getFrameTree");
+        const frames = [frameTree];
+        while (frames.length > 0) {
+          const item = frames.pop();
+          if (item.frame.url === frame.url()) {
+            target = { frameId: item.frame.id };
+            break;
+          }
+          frames.push(...(item.childFrames ?? []));
+        }
+        if (!target.frameId) continue;
+      }
+      const { nodes } = await devtools.send("Accessibility.getFullAXTree", target);
+      const checkbox = nodes.find(node => {
+        const state = Object.fromEntries((node.properties ?? []).map(property => [property.name, property.value?.value]));
+        return node.role?.value === "checkbox"
+          && /\bhuman\b|真人/i.test(node.name?.value ?? "")
+          && !node.ignored && !state.disabled && state.checked !== true && state.checked !== "true"
+          && Boolean(node.backendDOMNodeId);
+      });
+      if (!checkbox) continue;
+      await devtools.send("DOM.focus", { backendNodeId: checkbox.backendDOMNodeId });
+      await page.keyboard.press("Space");
+      console.log("已操作官网的标准验证框。");
+      return true;
+    } catch {
+      // The widget can transition to a new frame before the checkbox is available.
+    } finally {
+      await devtools?.detach().catch(() => {});
+    }
+  }
+  return false;
+}
+
+async function waitForVerification(page) {
+  let checked = false;
+  const deadline = Date.now() + 50000;
+  while (Date.now() < deadline) {
+    const verified = await page.evaluate(() => {
+      try {
+        if (window.turnstile?.getResponse()) return true;
+      } catch {
+        // The widget can still be initializing.
+      }
+      return [...document.querySelectorAll('input[name="cf-turnstile-response"]')].some(field => Boolean(field.value));
+    });
+    if (verified) {
+      console.log("Cloudflare 签到验证已通过。");
+      return;
+    }
+    if (!checked) checked = await useVerificationCheckbox(page);
+    await wait(400);
+  }
+  throw new CheckinError("云端浏览器未收到 Cloudflare 验证通过凭证。");
+}
+
 async function checkIn(page, expectedUser) {
   const challengeRequest = page.waitForResponse(
     response => response.url() === origin + "/api/user/checkin/challenge",
@@ -93,21 +159,7 @@ async function checkIn(page, expectedUser) {
 
   const challenge = await challengeRequest;
   if (challenge?.code !== 0) throw new CheckinError("官网没有发出可用的签到验证。");
-  if (challenge.turnstile) {
-    try {
-      await page.waitForFunction(() => {
-        try {
-          if (window.turnstile?.getResponse()) return true;
-        } catch {
-          // The widget can still be initializing.
-        }
-        return [...document.querySelectorAll('input[name="cf-turnstile-response"]')].some(field => Boolean(field.value));
-      }, undefined, { timeout: 50000 });
-    } catch {
-      throw new CheckinError("云端浏览器未收到 Cloudflare 验证通过凭证。");
-    }
-    console.log("Cloudflare 签到验证已通过。");
-  }
+  if (challenge.turnstile) await waitForVerification(page);
 
   const beforeIds = new Set(before.map(row => row.id));
   const [submitted] = await Promise.all([
