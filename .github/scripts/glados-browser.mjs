@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
@@ -38,12 +39,23 @@ function loadSession() {
   };
 }
 
-async function connectToChrome(profile, chrome) {
-  for (let attempt = 0; attempt < 40; attempt++) {
+async function availablePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address();
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+
+async function connectToChrome(port, chrome) {
+  const address = "http://127.0.0.1:" + port;
+  for (let attempt = 0; attempt < 60; attempt++) {
     if (chrome.exitCode !== null) break;
-    const file = await readFile(join(profile, "DevToolsActivePort"), "utf8").catch(() => "");
-    const port = file.split("\n")[0];
-    if (/^\d+$/.test(port)) return chromium.connectOverCDP("http://127.0.0.1:" + port);
+    const response = await fetch(address + "/json/version", { signal: AbortSignal.timeout(500) }).catch(() => null);
+    if (response?.ok) return chromium.connectOverCDP(address, { timeout: 15000 });
     await wait(250);
   }
   throw new CheckinError("GitHub 运行器未能启动 Chrome。");
@@ -98,6 +110,7 @@ async function useVerificationCheckbox(page) {
           && Boolean(node.backendDOMNodeId);
       });
       if (!checkbox) continue;
+      await page.bringToFront();
       await devtools.send("DOM.focus", { backendNodeId: checkbox.backendDOMNodeId });
       await page.keyboard.press("Space");
       console.log("已操作官网的标准验证框。");
@@ -150,6 +163,8 @@ async function checkIn(page, expectedUser) {
     throw new CheckinError("GLaDOS 云端会话失效，或当前会话与配置账号不符。");
   }
   console.log("已确认 GLaDOS 账号登录。");
+  const agent = await page.evaluate(() => navigator.userAgent);
+  console.log("云端浏览器：" + agent);
 
   const before = await readPoints(page);
   if (before.length > 0 && !verifyToday) {
@@ -162,6 +177,13 @@ async function checkIn(page, expectedUser) {
   if (challenge.turnstile) await waitForVerification(page);
 
   const beforeIds = new Set(before.map(row => row.id));
+  let sent = false;
+  await page.route(origin + "/api/user/checkin", route => {
+    if (route.request().method() !== "POST") return route.continue();
+    if (sent) return route.abort();
+    sent = true;
+    return route.continue();
+  });
   const [submitted] = await Promise.all([
     page.waitForResponse(
       response => response.url() === origin + "/api/user/checkin" && response.request().method() === "POST",
@@ -171,7 +193,7 @@ async function checkIn(page, expectedUser) {
   ]);
   const result = await submitted.json();
   if (result.reason === "device-mismatch") throw new CheckinError("GLaDOS 要求使用与云端 Chrome 匹配的登录会话。");
-  if (result.code === 1 && before.length > 0) {
+  if (result.code === 1 && (before.length > 0 || (await readPoints(page)).length > 0)) {
     console.log("云端签到请求已获官网响应，今日积分流水已存在。");
     return;
   }
@@ -189,9 +211,10 @@ let browser;
 try {
   const session = loadSession();
   profile = await mkdtemp(join(tmpdir(), "glados-chrome-"));
+  const port = await availablePort();
   chrome = spawn("google-chrome", [
     "--user-data-dir=" + profile,
-    "--remote-debugging-port=0",
+    "--remote-debugging-port=" + port,
     "--remote-debugging-address=127.0.0.1",
     "--no-first-run",
     "--no-default-browser-check",
@@ -201,10 +224,10 @@ try {
     chrome.once("spawn", resolve);
     chrome.once("error", reject);
   });
-  browser = await connectToChrome(profile, chrome);
-  const context = browser.contexts()[0];
+  browser = await connectToChrome(port, chrome);
+  const context = await browser.newContext({ locale: "en-US", serviceWorkers: "block" });
   await context.addCookies(session.cookies);
-  const page = context.pages()[0] ?? await context.newPage();
+  const page = await context.newPage();
   await checkIn(page, session.userId);
 } catch (error) {
   console.error(error instanceof CheckinError ? error.message : "GLaDOS 浏览器任务异常结束。");
