@@ -1,0 +1,33 @@
+name: GLaDOS browser check-in
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_browser:
+        description: "今天已签到时也核验云端浏览器流程"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glados-browser-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    name: GLaDOS via Google Chrome
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install browser driver
+        run: npm install --ignore-scripts --no-save --no-package-lock --no-audit --no-fund playwright@1.65.1
+      - name: Check in on GLaDOS
+        env:
+          GLADOS_BROWSER_SESSION: ${{ secrets.GLADOS_BROWSER_SESSION }}
+          VERIFY_BROWSER: ${{ inputs.verify_browser && '1' || '0' }}
+        run: xvfb-run -a node .github/scripts/glados-browser.mjs
